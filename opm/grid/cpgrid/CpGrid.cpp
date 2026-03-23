@@ -60,6 +60,8 @@
 //#include <opm/grid/common/WellConnections.hpp>
 #include <opm/grid/common/CommunicationUtils.hpp>
 
+#include "processEclipseFormat.cpp"
+
 //#include <fstream>
 //#include <iostream>
 #include <algorithm>
@@ -2808,5 +2810,208 @@ void CpGrid::updateCornerHistoryLevels(const std::vector<std::vector<std::array<
         }
     }
 }
+
+void CpGrid::copyAndOffset(std::vector<int>& vec1, std::vector<int> vec2, int offset) const {
+    std::transform(vec2.begin(), vec2.end(), vec2.begin(), [&](int x){return(x+offset);});
+    vec1.insert(vec1.end(), vec2.begin(), vec2.end());
+}
+
+void CpGrid::copyAndOffsetSparseTable(Opm::SparseTable<int>& tab1, Opm::SparseTable<int> tab2, int offset) const{
+    for (const auto& row : tab2)
+        tab1.appendRow(row.begin()+offset, row.end()+offset);
+}
+
+// void CpGrid::copyAndOffsetC2P(std::vector<std::array<int,8>>& vec1, std::vector<std::array<int,8>> vec2, int offset) const {
+// 	std::transform(vec2.begin(), vec2.end(), vec2.begin(), [&](std::array<int, 8> xs){
+// 		std::transform(xs.begin(), xs.end(), xs.begin(), [&](int x) {return (offset + x);});
+// 		return( xs );
+// 		});
+//     vec1.insert(vec1.end(), vec2.begin(), vec2.end());
+// }
+
+void CpGrid::copyAndOffsetC2P(std::vector<std::array<int,8>>& vec1,
+                               std::vector<std::array<int,8>> vec2,
+                               int offset) const
+{
+    for (auto& arr : vec2) {
+        for (auto& val : arr) {
+            val += offset;
+        }
+    }
+    vec1.insert(vec1.end(), vec2.begin(), vec2.end());
+}
+
+int CpGrid::cellGridOrigin(int c) const {
+    return current_data_->back()->cell_grid_origin_[c];
+}
+
+// const std::vector<int>& CpGrid::cellGridOrigins() const {
+//     return current_data_->back()->cell_grid_origin_;
+// }
+
+
+
+bool CpGrid::extendGrid(const CpGrid& grid2, Dune::FieldVector<double,3> gridshift, bool connectgrids) {
+    const int nc = this->numCells();
+    const int nf = this->numFaces();
+    const int nv = this->numVertices();
+
+
+    // snapshot of volumes and cell centers
+    std::vector<Dune::FieldVector<double,3>> centroids(nc);
+    std::vector<double>volumes(nc);
+
+
+
+    for (int c = 0; c < nc; ++c)
+    {
+        centroids[c] = this->cellCentroid(c);
+        volumes[c] = this->cellVolume(c);
+    }
+
+    // copy of topology
+    copyAndOffset(current_data_->back()->global_cell_, grid2.current_data_->back()->global_cell_, nc);
+    copyAndOffsetEntityTable<1>(current_data_->back()->face_to_cell_, grid2.current_data_->back()->face_to_cell_, nc);
+    copyAndOffsetEntityTable<0>(current_data_->back()->cell_to_face_, grid2.current_data_->back()->cell_to_face_, nf);
+    copyAndOffsetSparseTable(current_data_->back()->face_to_point_, grid2.current_data_->back()->face_to_point_, nv);
+    copyAndOffsetC2P(current_data_->back()->cell_to_point_, grid2.current_data_->back()->cell_to_point_, nv);
+
+
+    // copy new grid vertices and add to new
+    const auto& grid2_verts = *grid2.current_data_->back()->geometry_.geomVector(std::integral_constant<int,3>());
+    auto& my_verts = *current_data_->back()->geometry_.geomVector(std::integral_constant<int,3>());
+    for (const auto& v : grid2_verts) {
+        my_verts.push_back(cpgrid::Geometry<0,3>(v.center() + gridshift ));
+    }
+
+    // copy faces and add to new
+    const auto& grid2_faces = *grid2.current_data_->back()->geometry_.geomVector(std::integral_constant<int,1>());
+    auto& my_faces = *current_data_->back()->geometry_.geomVector(std::integral_constant<int,1>());
+    for (const auto& f : grid2_faces) {
+        my_faces.push_back(cpgrid::Geometry<2,3>(f.center() + gridshift , f.volume()));
+    }
+
+    copyGeometery(current_data_->back()->face_tag_,grid2.current_data_->back()->face_tag_);
+    copyGeometery(current_data_->back()->face_normals_,grid2.current_data_->back()->face_normals_);
+
+    // Cells
+    //cell_geom.reserve(nc);
+    // // MakeGeometry<3> mcellg(current_data_->back()->geometry_.geomVector(std::integral_constant<int,3>()));
+    //     auto allcorners_ptr = current_data_->back()->geometry_.geomVector(std::integral_constant<int,3>());
+	// cpgrid::EntityVariable<cpgrid::Geometry<3, 3>, 0> cell_geom;
+	// cell_geom.reserve(nc + grid2.numCells());
+
+
+    // rebuilding elements for the new grid generated
+    auto allcorners_ptr = current_data_->back()->geometry_.geomVector(std::integral_constant<int,3>());
+
+    cpgrid::EntityVariable<cpgrid::Geometry<3, 3>, 0> cell_geom;
+    cell_geom.reserve(nc + grid2.numCells());
+
+
+
+    for (int c = 0; c < nc; ++c) {
+        const int* cor_idx = current_data_->back()->cell_to_point_[c].data();
+        cell_geom.push_back(cpgrid::Geometry<3,3>(centroids[c], volumes[c], allcorners_ptr, cor_idx));
+    }
+    for (int c = 0; c < grid2.numCells(); ++c) {
+        const int* cor_idx = current_data_->back()->cell_to_point_[c + nc].data();
+        auto centroid = grid2.cellCentroid(c) + gridshift;
+        auto volume   = grid2.cellVolume(c);
+        cell_geom.push_back(cpgrid::Geometry<3,3>(centroid, volume, allcorners_ptr, cor_idx));
+    }
+    *current_data_->back()->geometry_.geomVector(std::integral_constant<int,0>()) = cell_geom;
+
+    std::cout << (*current_data_->back()->geometry_.geomVector(std::integral_constant<int,0>())).size() << std::endl;
+
+
+	// for (int c = 0;  c < nc; ++c) {
+    //     const int* cor_idx = current_data_->back()->cell_to_point_[c];
+	// 	// auto cell_centroids = this->cellCentroid(c);
+	// 	// auto cell_volumes = this->cellVolume(c);
+	// 	// auto c2p = current_data_->back()->cell_to_point_[c];
+	// 	cell_geom.push_back(cpgrid::Geometry<3,3>(centroids[c], volumes[c],allcorners_ptr,cor_idx));
+    //     // mcellg(centroids[c], volumes[c], c2p));
+    //     // auto this_cell = mcellg(centroids[c], volumes[c], c2p);
+    //     // typename cpgrid::Geometry<3,3>::LocalCoordinate local( 0.5 );
+    //     // std::cout << c << " " << centroids[c] << " " << this_cell.global(local) <<std::endl;
+    // }
+    // for (int c = 0;  c < grid2.numCells(); ++c) {
+	// 	// auto cell_centroids = grid2.cellCentroid(c);
+	// 	// auto cell_volumes = grid2.cellVolume(c);
+    //     const int* cor_idx = current_data_->back()->cell_to_point_[c];
+    //     auto centroid = grid2.cellCentroid(c);
+    //     auto volume   = grid2.cellVolume(c);
+    //     cell_geom.push_back(cpgrid::Geometry<3,3>(centroids, volumes,allcorners_ptr,cor_idx));
+
+	// 	// auto c2p = current_data_->back()->cell_to_point_[c+nc];
+	// 	// cell_geom.push_back(mcellg(centroids[c], volumes[c], c2p));
+    //     // auto this_cell = mcellg(centroids[c], volumes[c], c2p);
+    //     // typename cpgrid::Geometry<3,3>::LocalCoordinate local( 0.5 );
+    //     // std::cout << c +nc << " " << centroids[c] << " " << this_cell.global(local) <<std::endl;
+    // }
+	// *current_data_->back()->geometry_.geomVector(std::integral_constant<int,0>()) = cell_geom;
+
+	// // NB Needs to be fixed-- seems to work now
+    // if (connectgrids)
+	//     current_data_->back()->logical_cartesian_size_[2] += grid2.current_data_->back()->logical_cartesian_size_[2];
+
+	// current_data_->back()->index_set_ = std::make_unique<cpgrid::IndexSet>(current_data_->back()->cell_to_face_.size(), (*current_data_->back()->geometry_.geomVector(std::integral_constant<int,3>())).size());
+
+    // return true;
+
+
+        // --- Step 6: Flag cell origins ---
+    int next_origin = current_data_->back()->cell_grid_origin_.empty() ? 1 :
+        *std::max_element(current_data_->back()->cell_grid_origin_.begin(),
+                          current_data_->back()->cell_grid_origin_.end()) + 1;
+    current_data_->back()->cell_grid_origin_.resize(nc, 0);
+    current_data_->back()->cell_grid_origin_.insert(
+        current_data_->back()->cell_grid_origin_.end(),
+        grid2.numCells(), next_origin);
+
+    // --- Step 7: Update metadata ---
+    if (connectgrids)
+        current_data_->back()->logical_cartesian_size_[2] += grid2.current_data_->back()->logical_cartesian_size_[2];
+
+
+    current_data_->back()->index_set_ = std::make_unique<cpgrid::IndexSet>(
+        current_data_->back()->size(0),
+        current_data_->back()->size(3));
+    global_id_set_ptr_ = std::make_shared<cpgrid::GlobalIdSet>(*(current_data_->back()));
+
+    return true;
+
+
+
+
+     /*/
+    std::array<int, 3>                logical_cartesian_size_{};
+
+
+    /** @brief The boundary ids. */
+    //cpgrid::EntityVariable<int, 1> unique_boundary_ids_;
+    /** @brief The index set of the grid (level). */
+    //std::unique_ptr<cpgrid::IndexSet> index_set_;
+    /** @brief The internal local id set (not exported). */
+    //std::shared_ptr<const cpgrid::IdSet> local_id_set_;
+    /** @brief The global id set (used also as local id set). */
+    //std::shared_ptr<LevelGlobalIdSet> global_id_set_;
+    /** @brief The indicator of the partition type of the entities */
+    //std::shared_ptr<PartitionTypeIndicator> partition_type_indicator_;
+    /** Mark elements to be refined **/
+    //std::vector<int> mark_;
+    /** Level of the current CpGridData (0 when it's "GLOBAL", 1,2,.. for LGRs). */
+
+
+    /// \brief Object for collective communication operations.
+    //Communication ccobj_;
+
+    // Boundary information (optional).
+    //bool use_unique_boundary_ids_;
+
+}
+
+
 
 } // namespace Dune

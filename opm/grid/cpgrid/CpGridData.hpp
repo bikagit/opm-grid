@@ -793,6 +793,8 @@ private:
      * by the mapping to the underlying global cartesian mesh..
      */
     std::vector<int>                  global_cell_;
+    std::vector<int>                  cell_grid_origin_;
+
     /** @brief The tag of the faces. */
     cpgrid::EntityVariable<enum face_tag, 1> face_tag_;
     /** @brief The geometries representing the grid. */
